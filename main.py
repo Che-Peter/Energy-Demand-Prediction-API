@@ -2,6 +2,7 @@ import pandas as pd
 import joblib
 import csv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
@@ -54,6 +55,15 @@ joblib.dump(model, "model.pkl")
 # ----------------------------
 app = FastAPI()
 
+# Enable CORS so frontend on localhost can call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # or ["http://localhost:3000"] for stricter control
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Request schema for prediction
 class PredictionRequest(BaseModel):
     timestamp: int
@@ -71,7 +81,7 @@ class PredictionRequest(BaseModel):
     electricity_tariff: str
     appliance_category: str
 
-# Request schema for dataset update (respecting CSV column order)
+# Request schema for dataset update
 class UpdateRequest(BaseModel):
     timestamp: int
     voltage: float
@@ -132,6 +142,11 @@ def retrain():
 
 @app.post("/update")
 def update_table(req: UpdateRequest):
+    # Check if timestamp already exists
+    df = pd.read_csv("synthetic_dataset.csv")
+    if req.timestamp in df["timestamp"].values:
+        return {"status": f"Row with timestamp {req.timestamp} already exists, not appended"}
+
     new_row = [
         req.timestamp,
         req.voltage,
