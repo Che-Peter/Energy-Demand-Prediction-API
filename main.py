@@ -1,16 +1,17 @@
 import pandas as pd
 import joblib
+import csv
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 
 # ----------------------------
-# 1. Load and preprocess data
+# 1. Initial training on dataset
 # ----------------------------
 df = pd.read_csv("synthetic_dataset.csv")
 
-# Derive temporal features from timestamp
+# Temporal features
 df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
 df["hour"] = df["datetime"].dt.hour
 df["dayofweek"] = df["datetime"].dt.dayofweek
@@ -28,7 +29,7 @@ def time_of_day(hour):
 
 df["time_of_day"] = df["hour"].apply(time_of_day)
 
-# Encode categorical features
+# Categorical features
 categorical_cols = ["building_type", "operational_schedule",
                     "electricity_tariff", "appliance_category", "time_of_day"]
 
@@ -41,68 +42,70 @@ y = df_encoded["demand_kWh"]
 # Train/test split
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# ----------------------------
-# 2. Train model
-# ----------------------------
+# Train model
 model = RandomForestRegressor(n_estimators=200, random_state=42)
 model.fit(X_train, y_train)
 
 # Save model
 joblib.dump(model, "model.pkl")
-print("Model trained and saved as model.pkl")
 
 # ----------------------------
-# 3. FastAPI backend
+# 2. FastAPI backend
 # ----------------------------
 app = FastAPI()
 
-# Request schema
+# Request schema for prediction
 class PredictionRequest(BaseModel):
     timestamp: int
-    voltage: float = 230.0
-    current: float = 10.0
-    active_power: float = 2000.0
-    energy_consumption: float = 5.0
-    power_factor: float = 0.95
-    temperature: float = 28.0
-    humidity: float = 70.0
-    light_intensity: int = 500
-    building_type: str = "Residential"
-    occupancy_level: int = 15
-    operational_schedule: str = "Daytime"
-    electricity_tariff: str = "Peak"
-    appliance_category: str = "HVAC"
+    voltage: float
+    current: float
+    active_power: float
+    energy_consumption: float
+    power_factor: float
+    temperature: float
+    humidity: float
+    light_intensity: int
+    building_type: str
+    occupancy_level: int
+    operational_schedule: str
+    electricity_tariff: str
+    appliance_category: str
+
+# Request schema for dataset update (respecting CSV column order)
+class UpdateRequest(BaseModel):
+    timestamp: int
+    voltage: float
+    current: float
+    active_power: float
+    energy_consumption: float
+    power_factor: float
+    temperature: float
+    humidity: float
+    light_intensity: int
+    building_type: str
+    occupancy_level: int
+    operational_schedule: str
+    electricity_tariff: str
+    appliance_category: str
+    demand_kWh: float
 
 @app.post("/predict")
 def predict(req: PredictionRequest):
     model = joblib.load("model.pkl")
-
     input_dict = req.dict()
 
-    # Derive temporal features from timestamp
+    # Temporal features
     ts = pd.to_datetime(input_dict["timestamp"], unit="s")
     hour = ts.hour
     dayofweek = ts.dayofweek
     is_weekend = 1 if dayofweek in [5, 6] else 0
-
-    if 0 <= hour < 6:
-        tod = "Night"
-    elif 6 <= hour < 12:
-        tod = "Morning"
-    elif 12 <= hour < 18:
-        tod = "Day"
-    else:
-        tod = "Evening"
+    tod = time_of_day(hour)
 
     input_dict["time_of_day"] = tod
     input_dict["is_weekend"] = is_weekend
-
-    # Drop raw timestamp
     del input_dict["timestamp"]
 
     input_df = pd.DataFrame([input_dict])
-
-    # One-hot encode categorical features
     input_encoded = pd.get_dummies(input_df)
     input_encoded = input_encoded.reindex(columns=X.columns, fill_value=0)
 
@@ -112,7 +115,6 @@ def predict(req: PredictionRequest):
 @app.post("/train")
 def retrain():
     df = pd.read_csv("synthetic_dataset.csv")
-
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
     df["hour"] = df["datetime"].dt.hour
     df["dayofweek"] = df["datetime"].dt.dayofweek
@@ -127,3 +129,29 @@ def retrain():
     model.fit(X, y)
     joblib.dump(model, "model.pkl")
     return {"status": "Model retrained and saved"}
+
+@app.post("/update")
+def update_table(req: UpdateRequest):
+    new_row = [
+        req.timestamp,
+        req.voltage,
+        req.current,
+        req.active_power,
+        req.energy_consumption,
+        req.power_factor,
+        req.temperature,
+        req.humidity,
+        req.light_intensity,
+        req.building_type,
+        req.occupancy_level,
+        req.operational_schedule,
+        req.electricity_tariff,
+        req.appliance_category,
+        req.demand_kWh
+    ]
+
+    with open("synthetic_dataset.csv", "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(new_row)
+
+    return {"status": "Row appended to dataset"}
