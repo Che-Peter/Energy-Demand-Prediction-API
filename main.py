@@ -37,7 +37,8 @@ categorical_cols = ["building_type", "operational_schedule",
 df_encoded = pd.get_dummies(df, columns=categorical_cols)
 
 # Features and target
-X = df_encoded.drop(columns=["demand_kWh", "datetime"])
+# 👉 Drop energy_consumption so it is not used
+X = df_encoded.drop(columns=["demand_kWh", "datetime", "energy_consumption"])
 y = df_encoded["demand_kWh"]
 
 # Train/test split
@@ -55,22 +56,22 @@ joblib.dump(model, "model.pkl")
 # ----------------------------
 app = FastAPI()
 
-# Enable CORS so frontend on localhost can call this API
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # or ["http://localhost:3000"] for stricter control
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Request schema for prediction
+# Request schema
 class PredictionRequest(BaseModel):
     timestamp: int
     voltage: float
     current: float
     active_power: float
-    energy_consumption: float
+    energy_consumption: float   # present but ignored
     power_factor: float
     temperature: float
     humidity: float
@@ -81,13 +82,12 @@ class PredictionRequest(BaseModel):
     electricity_tariff: str
     appliance_category: str
 
-# Request schema for dataset update
 class UpdateRequest(BaseModel):
     timestamp: int
     voltage: float
     current: float
     active_power: float
-    energy_consumption: float
+    energy_consumption: float   # present but ignored in training
     power_factor: float
     temperature: float
     humidity: float
@@ -103,6 +103,9 @@ class UpdateRequest(BaseModel):
 def predict(req: PredictionRequest):
     model = joblib.load("model.pkl")
     input_dict = req.dict()
+
+    # Ignore energy_consumption in prediction
+    input_dict["energy_consumption"] = 0.0
 
     # Temporal features
     ts = pd.to_datetime(input_dict["timestamp"], unit="s")
@@ -132,7 +135,8 @@ def retrain():
     df["time_of_day"] = df["hour"].apply(time_of_day)
 
     df_encoded = pd.get_dummies(df, columns=categorical_cols)
-    X = df_encoded.drop(columns=["demand_kWh", "datetime"])
+    # Drop energy_consumption again
+    X = df_encoded.drop(columns=["demand_kWh", "datetime", "energy_consumption"])
     y = df_encoded["demand_kWh"]
 
     model = RandomForestRegressor(n_estimators=200, random_state=42)
@@ -142,7 +146,6 @@ def retrain():
 
 @app.post("/update")
 def update_table(req: UpdateRequest):
-    # Check if timestamp already exists
     df = pd.read_csv("synthetic_dataset.csv")
     if req.timestamp in df["timestamp"].values:
         return {"status": f"Row with timestamp {req.timestamp} already exists, not appended"}
@@ -150,9 +153,9 @@ def update_table(req: UpdateRequest):
     new_row = [
         req.timestamp,
         req.voltage,
-        req.current,
-        req.active_power,
-        req.energy_consumption,
+        req.current,       # keep current
+        req.active_power,  # keep active_power
+        req.energy_consumption,  # stored but ignored in training
         req.power_factor,
         req.temperature,
         req.humidity,
