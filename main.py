@@ -3,6 +3,7 @@ import joblib
 import csv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
@@ -37,7 +38,6 @@ categorical_cols = ["building_type", "operational_schedule",
 df_encoded = pd.get_dummies(df, columns=categorical_cols)
 
 # Features and target
-# 👉 Drop energy_consumption so it is not used
 X = df_encoded.drop(columns=["demand_kWh", "datetime", "energy_consumption"])
 y = df_encoded["demand_kWh"]
 
@@ -65,13 +65,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request schema
+# Request schemas
 class PredictionRequest(BaseModel):
     timestamp: int
     voltage: float
     current: float
     active_power: float
-    energy_consumption: float   # present but ignored
+    energy_consumption: float
     power_factor: float
     temperature: float
     humidity: float
@@ -82,94 +82,92 @@ class PredictionRequest(BaseModel):
     electricity_tariff: str
     appliance_category: str
 
-class UpdateRequest(BaseModel):
-    timestamp: int
-    voltage: float
-    current: float
-    active_power: float
-    energy_consumption: float   # present but ignored in training
-    power_factor: float
-    temperature: float
-    humidity: float
-    light_intensity: int
-    building_type: str
-    occupancy_level: int
-    operational_schedule: str
-    electricity_tariff: str
-    appliance_category: str
+class UpdateRequest(PredictionRequest):
     demand_kWh: float
 
+# ----------------------------
+# Endpoints
+# ----------------------------
 @app.post("/predict")
 def predict(req: PredictionRequest):
-    model = joblib.load("model.pkl")
-    input_dict = req.dict()
+    try:
+        model = joblib.load("model.pkl")
+        input_dict = req.dict()
+        input_dict["energy_consumption"] = 0.0
 
-    # Ignore energy_consumption in prediction
-    input_dict["energy_consumption"] = 0.0
+        ts = pd.to_datetime(input_dict["timestamp"], unit="s")
+        hour = ts.hour
+        dayofweek = ts.dayofweek
+        is_weekend = 1 if dayofweek in [5, 6] else 0
+        tod = time_of_day(hour)
 
-    # Temporal features
-    ts = pd.to_datetime(input_dict["timestamp"], unit="s")
-    hour = ts.hour
-    dayofweek = ts.dayofweek
-    is_weekend = 1 if dayofweek in [5, 6] else 0
-    tod = time_of_day(hour)
+        input_dict["time_of_day"] = tod
+        input_dict["is_weekend"] = is_weekend
+        del input_dict["timestamp"]
 
-    input_dict["time_of_day"] = tod
-    input_dict["is_weekend"] = is_weekend
-    del input_dict["timestamp"]
+        input_df = pd.DataFrame([input_dict])
+        input_encoded = pd.get_dummies(input_df)
+        input_encoded = input_encoded.reindex(columns=X.columns, fill_value=0)
 
-    input_df = pd.DataFrame([input_dict])
-    input_encoded = pd.get_dummies(input_df)
-    input_encoded = input_encoded.reindex(columns=X.columns, fill_value=0)
-
-    prediction = model.predict(input_encoded)[0]
-    return {"predicted_demand_kWh": round(float(prediction), 2)}
+        prediction = model.predict(input_encoded)[0]
+        return {"predicted_demand_kWh": round(float(prediction), 2)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/train")
 def retrain():
-    df = pd.read_csv("synthetic_dataset.csv")
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-    df["hour"] = df["datetime"].dt.hour
-    df["dayofweek"] = df["datetime"].dt.dayofweek
-    df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
-    df["time_of_day"] = df["hour"].apply(time_of_day)
+    try:
+        df = pd.read_csv("synthetic_dataset.csv")
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+        df["hour"] = df["datetime"].dt.hour
+        df["dayofweek"] = df["datetime"].dt.dayofweek
+        df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
+        df["time_of_day"] = df["hour"].apply(time_of_day)
 
-    df_encoded = pd.get_dummies(df, columns=categorical_cols)
-    # Drop energy_consumption again
-    X = df_encoded.drop(columns=["demand_kWh", "datetime", "energy_consumption"])
-    y = df_encoded["demand_kWh"]
+        df_encoded = pd.get_dummies(df, columns=categorical_cols)
+        X = df_encoded.drop(columns=["demand_kWh", "datetime", "energy_consumption"])
+        y = df_encoded["demand_kWh"]
 
-    model = RandomForestRegressor(n_estimators=200, random_state=42)
-    model.fit(X, y)
-    joblib.dump(model, "model.pkl")
-    return {"status": "Model retrained and saved"}
-
+        model = RandomForestRegressor(n_estimators=200, random_state=42)
+        model.fit(X, y)
+        joblib.dump(model, "model.pkl")
+        return {"status": "Model retrained and saved"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 @app.post("/update")
 def update_table(req: UpdateRequest):
-    df = pd.read_csv("synthetic_dataset.csv")
-    if req.timestamp in df["timestamp"].values:
-        return {"status": f"Row with timestamp {req.timestamp} already exists, not appended"}
+    try:
+        df = pd.read_csv("synthetic_dataset.csv")
 
-    new_row = [
-        req.timestamp,
-        req.voltage,
-        req.current,       # keep current
-        req.active_power,  # keep active_power
-        req.energy_consumption,  # stored but ignored in training
-        req.power_factor,
-        req.temperature,
-        req.humidity,
-        req.light_intensity,
-        req.building_type,
-        req.occupancy_level,
-        req.operational_schedule,
-        req.electricity_tariff,
-        req.appliance_category,
-        req.demand_kWh
-    ]
+        # Force timestamp column to integer for strict comparison
+        df["timestamp"] = df["timestamp"].astype(int)
 
-    with open("synthetic_dataset.csv", "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(new_row)
+        # Use Python list membership for exact match
+        if int(req.timestamp) in df["timestamp"].tolist():
+            return {"status": f"Row with timestamp {req.timestamp} already exists, not appended"}
 
-    return {"status": "Row appended to dataset"}
+        new_row = [
+            req.timestamp,
+            req.voltage,
+            req.current,
+            req.active_power,
+            req.energy_consumption,
+            req.power_factor,
+            req.temperature,
+            req.humidity,
+            req.light_intensity,
+            req.building_type,
+            req.occupancy_level,
+            req.operational_schedule,
+            req.electricity_tariff,
+            req.appliance_category,
+            req.demand_kWh
+        ]
+
+        with open("synthetic_dataset.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(new_row)
+
+        return {"status": "Row appended to dataset"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
