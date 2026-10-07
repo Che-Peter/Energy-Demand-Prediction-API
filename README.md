@@ -22,8 +22,9 @@ regenerates the forecasts for the next 24 hours in 15-minute steps.
 
 ## Deployment (Railway)
 
-- Add a volume and set `DATA_DIR` to its mount path, otherwise every redeploy wipes
-  the data and the next sync reloads everything from ThingSpeak.
+- Attach a volume. Data is stored at its mount path automatically
+  (`RAILWAY_VOLUME_MOUNT_PATH`); without a volume every redeploy wipes the data and
+  the next sync reloads everything from ThingSpeak. `DATA_DIR` overrides the location.
 - Run a single worker (the Procfile does).
 - Optional: `THINGSPEAK_CHANNEL`, `THINGSPEAK_READ_KEY`.
 

@@ -40,9 +40,12 @@ from xgboost import XGBRegressor
 # ----------------------------
 # Storage
 # ----------------------------
-# On Railway, mount a volume and set DATA_DIR to it, otherwise the data,
-# models and forecasts are wiped on every redeploy.
-DATA_DIR = os.environ.get("DATA_DIR", ".")
+# Data, models and forecasts must survive redeploys, so they go on the Railway volume:
+# Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically when a volume is attached.
+# DATA_DIR overrides it (e.g. for local testing); otherwise the current folder is used.
+DATA_DIR = (os.environ.get("DATA_DIR")
+            or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+            or ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DATA_FILE = os.path.join(DATA_DIR, "dataset.csv")
