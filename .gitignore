@@ -1,0 +1,7 @@
+# Runtime data lives in DATA_DIR (a Railway volume), never in the repo
+local_data/
+dataset.csv
+forecasts.csv
+*.pkl
+.venv/
+__pycache__/
