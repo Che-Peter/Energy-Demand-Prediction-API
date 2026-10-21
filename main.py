@@ -9,15 +9,17 @@ set and regenerates the next 24h of forecasts.
 For training, readings are cleaned and averaged into 15-minute buckets. A forecast for
 time t, made at "origin" (the latest data), is:
 
-    baseline = hour-of-day profile(t) + w(horizon) * anomaly(origin)
-    model    = baseline + shrink * residual_model(features)
+    baseline = hour-of-day profile(t) * level(origin)
+    model    = baseline * (1 + shrink * residual_model(features))
 
-- profile: mean demand for each hour of the day over the recent past
-- anomaly: how far the last hour was above/below its normal profile; w() is fitted
-  from data and fades to 0 for long horizons
-- residual models (XGBoost and RandomForest) learn what the baseline misses
-  (weekday effects, level shifts...). Each retrain validates them on the most recent
-  unseen data and `shrink` scales their correction down when it does not help.
+- profile: recency-weighted mean demand for each hour of the day over the recent weeks
+- level: demand over the last 24h relative to what the profile expected for those hours,
+  so the forecast follows level shifts (e.g. a building using half its usual power)
+- residual models (XGBoost and RandomForest) learn, as a fraction of the baseline, what
+  it misses (hour-specific changes, the last hour's deviation fading with horizon...).
+  Recent days weigh most. Each retrain backtests them the way the app uses them (train up
+  to a past moment, forecast the next 24h, repeat) and `shrink` scales their correction
+  down when it does not help.
 """
 import json
 import os
@@ -40,9 +42,9 @@ from xgboost import XGBRegressor
 # ----------------------------
 # Storage
 # ----------------------------
-# Data, models and forecasts must survive redeploys, so they go on the Railway volume:
-# Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically when a volume is attached.
-# DATA_DIR overrides it (e.g. for local testing); otherwise the current folder is used.
+# DATA_DIR sets where data, models and forecasts are stored; otherwise the current folder.
+# On hosts with a wiped disk (e.g. Render's free plan) the next sync reloads everything
+# from ThingSpeak and retrains; only past forecasts are lost.
 DATA_DIR = (os.environ.get("DATA_DIR")
             or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
             or ".")
@@ -75,12 +77,17 @@ HORIZONS_MIN = [15, 60, 240, 720, 1440]   # horizons the models are trained on
 FORECAST_HOURS = 24                       # automatic forecast window after each update
 MIN_VOLTAGE = 100.0                       # readings below this are outages / sensor errors
 MIN_TRAIN_BUCKETS = 96                    # one day of 15-minute buckets
-MIN_VALIDATION_BUCKETS = 96               # below this, residual models are not trusted
+MIN_VALIDATION_BUCKETS = 48               # below this, residual models are not trusted
 PROFILE_DAYS = 28                         # profile uses the most recent weeks only
+PROFILE_HALFLIFE_DAYS = 7                 # ...each week counting half as much as the next
+SAMPLE_HALFLIFE_DAYS = 3                  # residual models weight recent behaviour most
+LEVEL_WINDOW = "24h"                      # recent level the profile is scaled to
+BACKTEST_DAYS = 4                         # validation: 24h forecasts from cutoffs over these days
+BACKTEST_STEP = pd.Timedelta(hours=12)
 MAX_TRAIN_DAYS = 180                      # cap training cost as data grows
+MODEL_VERSION = 2                         # bump when the bundle format changes; forces a retrain
 
-FEATURES = ["hsin", "hcos", "dsin", "dcos", "is_weekend", "profile",
-            "anomaly", "level_ratio", "horizon"]
+FEATURES = ["hsin", "hcos", "level", "anomaly", "horizon"]
 
 # Serialises every read/write of the data, model and forecast files
 lock = threading.Lock()
@@ -131,16 +138,50 @@ def asof(series: pd.Series, when: pd.DatetimeIndex) -> np.ndarray:
     return out.astype(float)
 
 
+def load_bundle():
+    """The trained models, or None if missing or saved by an older version of this file."""
+    if not os.path.exists(MODEL_FILE):
+        return None
+    bundle = joblib.load(MODEL_FILE)
+    return bundle if bundle.get("version") == MODEL_VERSION else None
+
+
 def hourly_profile(series: pd.Series) -> pd.Series:
+    """
+    Daily shape: recency-weighted mean demand per hour of the day. Hours with no data
+    are interpolated from their neighbours and the shape is lightly smoothed.
+    """
     recent = series[series.index >= series.index.max() - pd.Timedelta(days=PROFILE_DAYS)]
-    return recent.groupby(recent.index.hour).mean()
+    age = np.asarray((recent.index.max() - recent.index) / pd.Timedelta(days=1))
+    w = 0.5 ** (age / PROFILE_HALFLIFE_DAYS)
+    g = pd.DataFrame({"v": recent.values * w, "w": w, "h": recent.index.hour}).groupby("h").sum()
+    p = (g["v"] / g["w"]).reindex(range(24))
+    # Three copies so interpolation and smoothing wrap around midnight
+    p3 = pd.concat([p, p, p], ignore_index=True).interpolate(limit_direction="both")
+    p3 = p3.rolling(3, center=True, min_periods=1).mean()
+    return pd.Series(p3.values[24:48], index=range(24))
 
 
-def build_features(targets, history: pd.Series, profile: pd.Series, mean_level: float,
-                   origins) -> pd.DataFrame:
+def recent_level(history: pd.Series, profile: pd.Series, origins) -> np.ndarray:
+    """
+    Recent demand relative to the profile: mean of the last LEVEL_WINDOW of readings
+    divided by the profile's mean over the same timestamps (1.0 when unknown).
+    """
+    if history.empty:
+        return np.ones(len(origins))
+    expected = pd.Series(profile.reindex(history.index.hour).values, index=history.index)
+    num = asof(history.rolling(LEVEL_WINDOW).mean(), origins)
+    den = asof(expected.rolling(LEVEL_WINDOW).mean(), origins)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = num / den
+    return np.where(np.isfinite(ratio) & (den > 0), ratio, 1.0)
+
+
+def build_features(targets, history: pd.Series, profile: pd.Series, origins) -> pd.DataFrame:
     """
     Features for forecasting `targets` from what was known at `origins`.
     Only data in `history` up to each origin is used, so nothing leaks from the future.
+    Also holds "baseline": the profile scaled to the recent level.
     """
     targets = pd.DatetimeIndex(targets)
     origins = pd.DatetimeIndex(origins)
@@ -149,80 +190,70 @@ def build_features(targets, history: pd.Series, profile: pd.Series, mean_level: 
     hour_frac = targets.hour + targets.minute / 60
     f["hsin"] = np.sin(2 * np.pi * hour_frac / 24)
     f["hcos"] = np.cos(2 * np.pi * hour_frac / 24)
-    f["dsin"] = np.sin(2 * np.pi * targets.dayofweek / 7)
-    f["dcos"] = np.cos(2 * np.pi * targets.dayofweek / 7)
-    f["is_weekend"] = (targets.dayofweek >= 5).astype(int)
 
-    f["profile"] = profile.reindex(targets.hour).fillna(mean_level).values
+    f["level"] = recent_level(history, profile, origins)
+    f["baseline"] = profile.reindex(targets.hour).values * f["level"].values
 
-    recent_1h = asof(history.rolling("1h").mean(), origins)
-    profile_at_origin = profile.reindex(origins.hour).fillna(mean_level).values
-    f["anomaly"] = np.nan_to_num(recent_1h - profile_at_origin)
-
-    level_24h = asof(history.rolling("24h").mean(), origins)
-    f["level_ratio"] = np.nan_to_num(level_24h / mean_level, nan=1.0) if mean_level else 1.0
+    # How far the last hour sits above/below the baseline, as a fraction
+    recent_1h = np.nan_to_num(asof(history.rolling("1h").mean(), origins), nan=float(history.mean()))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f["anomaly"] = np.clip(np.nan_to_num(recent_1h / f["baseline"].values - 1), -1, 3)
 
     f["horizon"] = ((targets - origins) / pd.Timedelta(minutes=1)).values
     return f
 
 
-def anomaly_weight(weights: dict, horizon_min) -> np.ndarray:
-    keys = sorted(weights)
-    return np.interp(horizon_min, keys, [weights[k] for k in keys], right=0.0)
-
-
-def training_rows(series: pd.Series, profile: pd.Series, mean_level: float):
+def training_rows(series: pd.Series, profile: pd.Series):
     """Every bucket is a target once per training horizon."""
     frames, ys = [], []
     for h in HORIZONS_MIN:
         origins = series.index - pd.Timedelta(minutes=h)
-        frames.append(build_features(series.index, series, profile, mean_level, origins))
+        frames.append(build_features(series.index, series, profile, origins))
         ys.append(series.values)
     return pd.concat(frames), np.concatenate(ys)
 
 
-def fit_anomaly_weights(X: pd.DataFrame, y: np.ndarray) -> dict:
-    """Least-squares weight of the current anomaly for each horizon, clipped to [0, 1]."""
-    weights = {}
-    for h in HORIZONS_MIN:
-        m = (X["horizon"] == h).values
-        a = X["anomaly"].values[m]
-        r = y[m] - X["profile"].values[m]
-        denom = float((a * a).sum())
-        weights[h] = float(np.clip((a * r).sum() / denom, 0, 1)) if denom > 0 else 0.0
-    return weights
+def relative_residual(y, baseline) -> np.ndarray:
+    """What the residual models learn: actual / baseline - 1, clipped against outliers."""
+    return np.clip(np.asarray(y) / np.maximum(baseline, 1e-6), 0, 4) - 1
 
 
 def fit_models(series: pd.Series):
     profile = hourly_profile(series)
-    mean_level = float(series.mean())
-    X, y = training_rows(series, profile, mean_level)
-    weights = fit_anomaly_weights(X, y)
-    baseline = X["profile"].values + X["anomaly"].values * anomaly_weight(weights, X["horizon"].values)
+    X, y = training_rows(series, profile)
+    target = relative_residual(y, X["baseline"].values)
+    age = np.asarray((series.index.max() - X.index) / pd.Timedelta(days=1))
+    weight = 0.5 ** (age / SAMPLE_HALFLIFE_DAYS)
 
     xgb = XGBRegressor(
-        n_estimators=150, learning_rate=0.03, max_depth=3,
-        subsample=0.8, colsample_bytree=0.8, min_child_weight=20, reg_lambda=10,
+        n_estimators=150, learning_rate=0.05, max_depth=3,
+        subsample=0.8, min_child_weight=20, reg_lambda=10,
         random_state=42, objective="reg:squarederror"
     )
-    xgb.fit(X[FEATURES], y - baseline)
+    xgb.fit(X[FEATURES], target, sample_weight=weight)
 
     rf = RandomForestRegressor(
-        n_estimators=150, min_samples_leaf=30, max_features=0.6, random_state=42, n_jobs=-1
+        n_estimators=150, min_samples_leaf=50, max_features=0.5, max_depth=6,
+        random_state=42, n_jobs=-1
     )
-    rf.fit(X[FEATURES], y - baseline)
+    rf.fit(X[FEATURES], target, sample_weight=weight)
 
-    return {"xgb": xgb, "rf": rf, "profile": profile, "mean_level": mean_level, "weights": weights}
+    return {"xgb": xgb, "rf": rf, "profile": profile, "version": MODEL_VERSION}
+
+
+def raw_parts(bundle, history: pd.Series, targets, origin):
+    """(profile only, baseline, xgb correction, rf correction), before shrinking."""
+    targets = pd.DatetimeIndex(targets)
+    X = build_features(targets, history, bundle["profile"], [origin] * len(targets))
+    return (bundle["profile"].reindex(targets.hour).values, X["baseline"].values,
+            bundle["xgb"].predict(X[FEATURES]), bundle["rf"].predict(X[FEATURES]))
 
 
 def predict_parts(bundle, history: pd.Series, targets, origin):
     """Returns (baseline, xgb, rf) arrays for the targets."""
-    targets = pd.DatetimeIndex(targets)
-    origins = pd.DatetimeIndex([origin] * len(targets))
-    X = build_features(targets, history, bundle["profile"], bundle["mean_level"], origins)
-    baseline = X["profile"].values + X["anomaly"].values * anomaly_weight(bundle["weights"], X["horizon"].values)
-    xgb = baseline + bundle["shrink_xgb"] * bundle["xgb"].predict(X[FEATURES])
-    rf = baseline + bundle["shrink_rf"] * bundle["rf"].predict(X[FEATURES])
+    _, baseline, xgb_raw, rf_raw = raw_parts(bundle, history, targets, origin)
+    xgb = baseline * (1 + bundle["shrink_xgb"] * xgb_raw)
+    rf = baseline * (1 + bundle["shrink_rf"] * rf_raw)
     # Demand can't be negative
     return np.maximum(baseline, 0), np.maximum(xgb, 0), np.maximum(rf, 0)
 
@@ -231,54 +262,50 @@ def mae(a, b):
     return round(float(np.mean(np.abs(np.asarray(a) - np.asarray(b)))), 2)
 
 
-def best_shrink(residual_pred, residual_true) -> float:
+def best_shrink(baseline, correction, truth) -> float:
     """How much of a residual model's correction to keep, fitted on unseen data."""
-    denom = float((residual_pred * residual_pred).sum())
+    step = baseline * correction
+    denom = float((step * step).sum())
     if denom <= 0:
         return 0.0
-    return float(np.clip((residual_pred * residual_true).sum() / denom, 0, 1))
+    return float(np.clip((step * (truth - baseline)).sum() / denom, 0, 1))
 
 
 def validate(series: pd.Series):
     """
-    Train on the older 80% of buckets, test on the newest 20% (as real forecasts from
-    each horizon). Returns error metrics and how much to trust each residual model.
+    Backtest exactly what the app shows: every BACKTEST_STEP over the last BACKTEST_DAYS,
+    train only on the data up to that moment and forecast the next 24h. Returns error
+    metrics and how much to trust each residual model.
     """
-    split = int(len(series) * 0.8)
-    train, test = series.iloc[:split], series.iloc[split:]
-    if len(test) < MIN_VALIDATION_BUCKETS or len(train) < MIN_TRAIN_BUCKETS:
+    end = series.index.max()
+    cutoffs = pd.date_range(end - pd.Timedelta(days=BACKTEST_DAYS), end - BACKTEST_STEP, freq=BACKTEST_STEP)
+    parts = {"profile": [], "baseline": [], "xgb": [], "rf": [], "truth": []}
+    for cutoff in cutoffs:
+        train = series[series.index <= cutoff]
+        test = series[(series.index > cutoff) & (series.index <= cutoff + pd.Timedelta(hours=FORECAST_HOURS))]
+        if len(train) < MIN_TRAIN_BUCKETS or test.empty:
+            continue
+        fitted = fit_models(train)
+        for key, values in zip(["profile", "baseline", "xgb", "rf"],
+                               raw_parts(fitted, train, test.index, train.index.max())):
+            parts[key].append(values)
+        parts["truth"].append(test.values)
+
+    if sum(len(t) for t in parts["truth"]) < MIN_VALIDATION_BUCKETS:
         return None, 0.0, 0.0
+    profile, base, xgb_raw, rf_raw, truth = (
+        np.concatenate(parts[k]) for k in ["profile", "baseline", "xgb", "rf", "truth"])
 
-    fitted = fit_models(train)
-    profile, mean_level = fitted["profile"], fitted["mean_level"]
-
-    preds = {"profile": [], "baseline": [], "xgb_raw": [], "rf_raw": []}
-    truth = []
-    for h in HORIZONS_MIN:
-        origins = test.index - pd.Timedelta(minutes=h)
-        X = build_features(test.index, series, profile, mean_level, origins)
-        base = X["profile"].values + X["anomaly"].values * anomaly_weight(fitted["weights"], X["horizon"].values)
-        preds["profile"].append(X["profile"].values)
-        preds["baseline"].append(base)
-        preds["xgb_raw"].append(fitted["xgb"].predict(X[FEATURES]))
-        preds["rf_raw"].append(fitted["rf"].predict(X[FEATURES]))
-        truth.append(test.values)
-
-    truth = np.concatenate(truth)
-    base = np.concatenate(preds["baseline"])
-    xgb_raw = np.concatenate(preds["xgb_raw"])
-    rf_raw = np.concatenate(preds["rf_raw"])
-
-    shrink_xgb = best_shrink(xgb_raw, truth - base)
-    shrink_rf = best_shrink(rf_raw, truth - base)
+    shrink_xgb = best_shrink(base, xgb_raw, truth)
+    shrink_rf = best_shrink(base, rf_raw, truth)
 
     metrics = {
-        "validation_buckets": int(len(test)),
-        "mean_demand": round(float(test.mean()), 2),
-        "mae_profile_only": mae(np.concatenate(preds["profile"]), truth),
-        "mae_baseline": mae(base, truth),
-        "mae_xgb": mae(base + shrink_xgb * xgb_raw, truth),
-        "mae_rf": mae(base + shrink_rf * rf_raw, truth),
+        "validation_buckets": int(len(truth)),
+        "mean_demand": round(float(truth.mean()), 2),
+        "mae_profile_only": mae(profile, truth),
+        "mae_baseline": mae(np.maximum(base, 0), truth),
+        "mae_xgb": mae(np.maximum(base * (1 + shrink_xgb * xgb_raw), 0), truth),
+        "mae_rf": mae(np.maximum(base * (1 + shrink_rf * rf_raw), 0), truth),
         "shrink_xgb": round(shrink_xgb, 2),
         "shrink_rf": round(shrink_rf, 2),
     }
@@ -305,11 +332,9 @@ def generate_forecasts(bundle, history: pd.Series, hours=FORECAST_HOURS) -> pd.D
 def refresh_forecasts() -> int:
     """Regenerate upcoming forecasts with the current models and latest data."""
     with lock:
-        if not os.path.exists(MODEL_FILE):
-            return 0
-        bundle = joblib.load(MODEL_FILE)
+        bundle = load_bundle()
         history = demand_series(load_csv(DATA_FILE, COLUMNS))
-    if history.empty:
+    if bundle is None or history.empty:
         return 0
     fc = generate_forecasts(bundle, history)
     with lock:
@@ -434,7 +459,7 @@ def sync_from_thingspeak() -> dict:
                 upsert(DATA_FILE, COLUMNS, pd.DataFrame(rows, columns=COLUMNS))
 
         result = {"added": len(rows), "from": int((start - pd.Timestamp(0)) // pd.Timedelta(seconds=1))}
-        if rows or not os.path.exists(MODEL_FILE):
+        if rows or load_bundle() is None:
             try:
                 result["train"] = train_models()
             except (TrainingSkipped, ValueError) as e:
@@ -477,7 +502,7 @@ class PredictionRequest(BaseModel):
 def status():
     with lock:
         df = load_csv(DATA_FILE, COLUMNS)
-        bundle = joblib.load(MODEL_FILE) if os.path.exists(MODEL_FILE) else None
+        bundle = load_bundle()
     return {
         "rows": len(df),
         "first_timestamp": int(df["timestamp"].min()) if len(df) else None,
@@ -544,9 +569,9 @@ def predict(req: PredictionRequest):
     """Forecast one moment from the latest data, and store it."""
     try:
         with lock:
-            if not os.path.exists(MODEL_FILE):
+            bundle = load_bundle()
+            if bundle is None:
                 return JSONResponse(status_code=503, content={"error": "Model not trained yet"})
-            bundle = joblib.load(MODEL_FILE)
             history = demand_series(load_csv(DATA_FILE, COLUMNS))
         if history.empty:
             return JSONResponse(status_code=503, content={"error": "No data to forecast from"})

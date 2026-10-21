@@ -2,7 +2,7 @@
 Checks a running backend end to end.
 
     python test_api.py                                   # local backend on port 8000
-    python test_api.py https://energy-demand-prediction-api-production.up.railway.app
+    python test_api.py https://energy-demand-prediction-api-m2kj.onrender.com
     python test_api.py http://localhost:8000 --reset     # wipe first, then full reload
 
 Without --reset nothing is deleted, so it is safe to run against the live server.
